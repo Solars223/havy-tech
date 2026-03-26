@@ -12,6 +12,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <DNSServer.h>
+#include <ctype.h>
 #include <WebServer.h>
 #include "esp_wifi.h"
 #include "pinout.h"
@@ -23,6 +24,20 @@
 #define MAX_RAW_SAMPLES 512 
 int rawSamples[MAX_RAW_SAMPLES];
 int rawSampleCount = 0;
+
+enum WiFiSniffMode : uint8_t {
+  SNIFF_BEACON = 0,
+  SNIFF_DEAUTH,
+  SNIFF_PWNAGOTCHI,
+  SNIFF_PINEAPPLE
+};
+
+static void drawCentered(const char* s, int y) {
+  int w = u8g2.getStrWidth(s);
+  int x = (128 - w) / 2;
+  if (x < 0) x = 0;
+  u8g2.drawStr(x, y, s);
+}
 
 String capturedLogin = "Wait...";
 String capturedPass = "Wait...";
@@ -201,15 +216,17 @@ bool retrySDInit() {
 
 
 
-enum State { MAIN_MENU, WIFI_MENU, BLE_MENU, SUBGHZ_MENU, IR_MENU, NRF_MENU };
+enum State { MAIN_MENU, WIFI_MENU, WIFI_SNIFFER_MENU, BLE_MENU, SUBGHZ_MENU, IR_MENU, NRF_MENU,  SETTINGS_MENU };
 State currentState = MAIN_MENU;
 int cursor = 0;
 
 int animatedY = 0;
 
 
-const char* mainItems[] = {"WIFI", "BLE", "SUB-GHZ", "INFRARED", "NRF24"};
-const char* wifiItems[] = {"Deauth", "Scan", "Beacon", "Packet", "Portal"};
+const char* mainItems[] = {"WIFI", "BLE", "SUB-GHZ", "INFRARED", "NRF24", "SETTINGS"};
+const char* settingsItems[] = {"About", "Turn-Off"};
+const char* wifiItems[] = {"Deauth", "Scan", "Beacon", "Packet", "Portal", "Sniffer"};
+const char* wifiSnifferItems[] = {"Beacon sniff", "Deauth sniff", "Pwnagotchi sniff", "Pineapple sniff"};
 const char* bleItems[] = {"IOS spam", "Android spam", "Windows spam"};
 const char* irItems[] = {"Read", "Send", "TV universal", "PJ universal", "Jammer"};
 const char* subghzItems[] = {"Read", "Raw", "Send", "Analyzer", "BruteForce","Jammer"};
@@ -604,8 +621,7 @@ void runBeaconSpam() {
 
 volatile int packetCount = 0;
 
-
-void wifi_sniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
+void wifiPacketCounterCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
   packetCount++;
 }
 
@@ -660,7 +676,7 @@ void runWiFiPacket() {
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&wifi_sniffer);
+  esp_wifi_set_promiscuous_rx_cb(&wifiPacketCounterCallback);
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
   int graph[128] = {0};
@@ -714,6 +730,296 @@ void runWiFiPacket() {
   esp_wifi_set_promiscuous(false);
   WiFi.mode(WIFI_OFF);
 }
+
+
+static volatile WiFiSniffMode g_sniffMode = SNIFF_BEACON;
+static volatile uint8_t g_sniffChannel = 1;
+
+#define SNIFF_MAX_LINES 7
+#define SNIFF_LINE_LEN  24
+
+static char g_sniffLines[SNIFF_MAX_LINES][SNIFF_LINE_LEN + 1];
+static volatile uint8_t g_sniffWrite = 0;
+static volatile uint8_t g_sniffCount = 0;
+
+static inline void sniffClearLog() {
+  g_sniffWrite = 0;
+  g_sniffCount = 0;
+  for (int i = 0; i < SNIFF_MAX_LINES; i++) g_sniffLines[i][0] = '\0';
+}
+
+static inline void sniffPushLine(const char* s) {
+  if (!s) return;
+
+  uint8_t w = g_sniffWrite;
+  size_t n = strlen(s);
+  if (n > SNIFF_LINE_LEN) n = SNIFF_LINE_LEN;
+
+  memcpy(g_sniffLines[w], s, n);
+  g_sniffLines[w][n] = '\0';
+
+  g_sniffWrite = (uint8_t)((w + 1) % SNIFF_MAX_LINES);
+  if (g_sniffCount < SNIFF_MAX_LINES) g_sniffCount++;
+}
+
+static inline void macToStr(const uint8_t* mac, char* out, size_t outSize) {
+  snprintf(out, outSize, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static inline bool macStartsWith3(const uint8_t* mac, uint8_t a, uint8_t b, uint8_t c) {
+  return mac[0] == a && mac[1] == b && mac[2] == c;
+}
+
+// Raspberry Pi OUIs (часто встречаются у Pwnagotchi на Pi Zero)
+static inline bool isRaspberryPiOUI(const uint8_t* mac) {
+  return macStartsWith3(mac, 0xB8, 0x27, 0xEB) ||
+         macStartsWith3(mac, 0xDC, 0xA6, 0x32) ||
+         macStartsWith3(mac, 0xE4, 0x5F, 0x01) ||
+         macStartsWith3(mac, 0x28, 0xCD, 0xC1);
+}
+
+// Hak5 часто использует 00:13:37
+static inline bool isHak5OUI(const uint8_t* mac) {
+  return macStartsWith3(mac, 0x00, 0x13, 0x37);
+}
+
+static bool containsTokenCI_bytes(const uint8_t* data, int len, const char* token) {
+  if (!data || !token) return false;
+  int tlen = (int)strlen(token);
+  if (tlen <= 0 || tlen > len) return false;
+
+  for (int i = 0; i <= len - tlen; i++) {
+    int j = 0;
+    for (; j < tlen; j++) {
+      unsigned char a = data[i + j];
+      unsigned char b = (unsigned char)token[j];
+      if (tolower(a) != tolower(b)) break;
+    }
+    if (j == tlen) return true;
+  }
+  return false;
+}
+
+static bool extractSSIDFromMgmt(const uint8_t* frame, int len, uint8_t subtype, char* out, size_t outSize) {
+  if (!frame || !out || outSize < 2) return false;
+
+  int pos = -1;
+
+  // Beacon(0x80) / Probe Response(0x50): fixed parameters 12 bytes, IEs start at 36
+  if (subtype == 0x80 || subtype == 0x50) pos = 36;
+  // Probe Request(0x40): IEs start at 24
+  else if (subtype == 0x40) pos = 24;
+  else return false;
+
+  if (pos < 0 || pos + 2 > len) return false;
+
+  while (pos + 2 <= len) {
+    uint8_t tagId = frame[pos];
+    uint8_t tagLen = frame[pos + 1];
+    pos += 2;
+    if (pos + tagLen > len) break;
+
+    if (tagId == 0x00) { // SSID
+      if (tagLen == 0) {
+        snprintf(out, outSize, "<hidden>");
+        return true;
+      }
+      size_t copyLen = tagLen;
+      if (copyLen > outSize - 1) copyLen = outSize - 1;
+      memcpy(out, frame + pos, copyLen);
+      out[copyLen] = '\0';
+      return true;
+    }
+
+    pos += tagLen;
+  }
+
+  return false;
+}
+
+static bool isPwnagotchiHit(const uint8_t* frame, int len, const uint8_t* srcMac, const char* ssidOrNull) {
+  // 1) SSID эвристика
+  if (ssidOrNull) {
+    if (strcasestr(ssidOrNull, "pwnagotchi")) return true;
+    if (strcasestr(ssidOrNull, "pwngrid")) return true;
+    if (strcasestr(ssidOrNull, "pwn")) return true;
+  }
+
+  // 2) Поиск токенов прямо в кадре (Vendor IEs и т.п.)
+  if (containsTokenCI_bytes(frame, len, "pwnagotchi")) return true;
+  if (containsTokenCI_bytes(frame, len, "pwngrid")) return true;
+
+  // 3) OUI Raspberry Pi (на деаут/пробах часто палится)
+  if (srcMac && isRaspberryPiOUI(srcMac)) return true;
+
+  return false;
+}
+
+static bool isPineappleHit(const uint8_t* frame, int len, const uint8_t* srcMac, const char* ssidOrNull) {
+  if (ssidOrNull) {
+    if (strcasestr(ssidOrNull, "pineapple")) return true;
+    if (strcasestr(ssidOrNull, "pineap")) return true;
+    if (strcasestr(ssidOrNull, "hak5")) return true;
+    if (strcasestr(ssidOrNull, "openap")) return true;
+    if (strcasestr(ssidOrNull, "secureap")) return true;
+  }
+
+  if (containsTokenCI_bytes(frame, len, "pineapple")) return true;
+  if (containsTokenCI_bytes(frame, len, "pineap")) return true;
+  if (containsTokenCI_bytes(frame, len, "hak5")) return true;
+
+  if (srcMac && isHak5OUI(srcMac)) return true;
+
+  return false;
+}
+
+// Marauder-style: лог в callback (максимально лёгкий, без String)
+static void wifiSnifferConsoleCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;
+
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  const uint8_t* frame = pkt->payload;
+  int len = pkt->rx_ctrl.sig_len;
+  if (len < 24) return;
+
+  const int8_t rssi = pkt->rx_ctrl.rssi;
+  const uint8_t subtype = frame[0] & 0xF0;
+
+  const uint8_t* src = frame + 10; // addr2 (transmitter)
+
+  // небольшой антиспам, чтобы OLED успевал (как у многих "console sniffers")
+  static uint32_t lastLogMs = 0;
+  uint32_t now = millis();
+  if (now - lastLogMs < 20) return;
+  lastLogMs = now;
+
+  char ssid[33];
+  bool hasSSID = false;
+
+  if (subtype == 0x80 || subtype == 0x50 || subtype == 0x40) {
+    hasSSID = extractSSIDFromMgmt(frame, len, subtype, ssid, sizeof(ssid));
+  }
+
+  // -------- Beacon sniff: только beacon и только SSID --------
+  if (g_sniffMode == SNIFF_BEACON) {
+    if (subtype == 0x80 && hasSSID) {
+      sniffPushLine(ssid);
+    }
+    return;
+  }
+
+  // -------- Deauth sniff: deauth + disassoc, RSSI + MAC --------
+  if (g_sniffMode == SNIFF_DEAUTH) {
+    if (subtype == 0xC0 || subtype == 0xA0) {
+      char macStr[18];
+      macToStr(src, macStr, sizeof(macStr));
+
+      char line[32];
+      snprintf(line, sizeof(line), "%d %s", (int)rssi, macStr);
+      sniffPushLine(line);
+    }
+    return;
+  }
+
+  // -------- Pwnagotchi / Pineapple sniff --------
+  bool hit = false;
+
+  if (g_sniffMode == SNIFF_PWNAGOTCHI) {
+    hit = isPwnagotchiHit(frame, len, src, hasSSID ? ssid : nullptr);
+  } else if (g_sniffMode == SNIFF_PINEAPPLE) {
+    hit = isPineappleHit(frame, len, src, hasSSID ? ssid : nullptr);
+  }
+
+  if (hit) {
+    char macStr[18];
+    macToStr(src, macStr, sizeof(macStr));
+
+    char line[32];
+    snprintf(line, sizeof(line), "%d %s", (int)rssi, macStr);
+    sniffPushLine(line);
+
+    if (hasSSID) sniffPushLine(ssid);
+  }
+}
+
+static void startWiFiSnifferConsole(WiFiSniffMode mode) {
+  sniffClearLog();
+  g_sniffMode = mode;
+  g_sniffChannel = 1;
+
+  WiFi.mode(WIFI_MODE_NULL);
+  delay(80);
+
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(&wifiSnifferConsoleCallback);
+  esp_wifi_set_channel(g_sniffChannel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(true);
+}
+
+static void stopWiFiSnifferConsole() {
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_OFF);
+}
+
+static void drawWiFiSnifferConsole(const char* title) {
+  u8g2.clearBuffer();
+  drawStars();
+
+  u8g2.setFont(u8g2_font_5x8_tf);
+
+  // title left
+  u8g2.drawStr(0, 8, title);
+
+  // channel right: [CH: 1]
+  char chBuf[12];
+  snprintf(chBuf, sizeof(chBuf), "[CH: %d]", (int)g_sniffChannel);
+  int w = u8g2.getStrWidth(chBuf);
+  u8g2.drawStr(128 - w, 8, chBuf);
+
+  // если лог пустой — экран почти пустой (как просил)
+  uint8_t count = g_sniffCount;
+  if (count > 0) {
+    // показываем от старых к новым
+    uint8_t start = (g_sniffWrite + (SNIFF_MAX_LINES - count)) % SNIFF_MAX_LINES;
+
+    for (uint8_t i = 0; i < count; i++) {
+      uint8_t idx = (start + i) % SNIFF_MAX_LINES;
+      int y = 18 + i * 8;
+      u8g2.drawStr(0, y, g_sniffLines[idx]);
+    }
+  }
+
+  u8g2.sendBuffer();
+}
+
+static void runWiFiSnifferConsole(WiFiSniffMode mode, const char* title) {
+  startWiFiSnifferConsole(mode);
+
+  uint32_t lastHop = millis();
+  while (digitalRead(BTN_BACK) == HIGH) {
+    // hop channels 1..13
+    if (millis() - lastHop > 350) {
+      uint8_t ch = g_sniffChannel + 1;
+      if (ch > 13) ch = 1;
+      g_sniffChannel = ch;
+      esp_wifi_set_channel(g_sniffChannel, WIFI_SECOND_CHAN_NONE);
+      lastHop = millis();
+    }
+
+    drawWiFiSnifferConsole(title);
+    delay(35);
+  }
+
+  stopWiFiSnifferConsole();
+}
+
+// wrappers
+static void runBeaconSniff()     { runWiFiSnifferConsole(SNIFF_BEACON,     "Beacon sniff"); }
+static void runDeauthSniff()     { runWiFiSnifferConsole(SNIFF_DEAUTH,     "Deauth sniff"); }
+static void runPwnagotchiSniff() { runWiFiSnifferConsole(SNIFF_PWNAGOTCHI, "Pwnagotchi"); }
+static void runPineappleSniff()  { runWiFiSnifferConsole(SNIFF_PINEAPPLE,  "Pineapple"); }
 
 
 void handleRoot() {
@@ -1923,6 +2229,69 @@ void showInitStatus() {
   }
 }
 
+void runSettingsAbout() {
+  while (digitalRead(BTN_OK) == LOW) delay(10);
+  delay(200);
+
+  while (digitalRead(BTN_BACK) == HIGH) {
+    u8g2.clearBuffer();
+    drawStars();
+    u8g2.drawFrame(0, 0, 128, 64);
+
+    u8g2.setFont(u8g2_font_6x12_tf);
+    drawCentered("firmware", 16);
+
+    u8g2.setFont(u8g2_font_10x20_tf);
+    drawCentered("havy-tech", 40);
+
+    u8g2.setFont(u8g2_font_6x12_tf);
+    drawCentered("version: 2.0.", 62);
+
+    u8g2.sendBuffer();
+    delay(50);
+  }
+}
+
+void runSettingsTurnOff() {
+  while (digitalRead(BTN_OK) == LOW) delay(10);
+  delay(200);
+
+  // выключаем экран полностью
+  u8g2.clearBuffer();
+  u8g2.sendBuffer();
+  delay(20);
+  u8g2.setPowerSave(1);
+
+  // опционально: выключить WiFi для экономии
+  WiFi.mode(WIFI_OFF);
+
+  uint32_t holdStart = 0;
+
+  // включаем экран только если OK удерживают 3 секунды
+  while (true) {
+    if (digitalRead(BTN_OK) == LOW) {
+      if (holdStart == 0) holdStart = millis();
+      if (millis() - holdStart >= 3000) break;
+    } else {
+      holdStart = 0;
+    }
+    delay(30);
+  }
+
+  // включаем обратно
+  u8g2.setPowerSave(0);
+  delay(50);
+
+  // короткий экран подтверждения
+  u8g2.clearBuffer();
+  drawStars();
+  u8g2.drawFrame(0, 0, 128, 64);
+  u8g2.setFont(u8g2_font_6x12_tf);
+  drawCentered("Screen ON", 34);
+  u8g2.sendBuffer();
+  delay(600);
+}
+
 void initModules() {
 
   pinMode(SD_MISO, INPUT_PULLUP);
@@ -2006,13 +2375,18 @@ void loop() {
 
   if (currentState == MAIN_MENU) {
     currentList = mainItems;
-    maxItems = 5;
+    maxItems = 6;
     title = "MAIN";
   }
   else if (currentState == WIFI_MENU) {
     currentList = wifiItems;
-    maxItems = 5;
+    maxItems = 6;
     title = "WIFI";
+  }
+  else if (currentState == WIFI_SNIFFER_MENU) {
+    currentList = wifiSnifferItems;
+    maxItems = 4;
+    title = "SNIFF";
   }
   else if (currentState == BLE_MENU) {
     currentList = bleItems;
@@ -2033,6 +2407,11 @@ void loop() {
     currentList = nrfItems;
     maxItems = 2;
     title = "NRF24";
+  }
+    else if (currentState == SETTINGS_MENU) {
+    currentList = settingsItems;
+    maxItems = 2;
+    title = "SET";
   }
   else {
     currentState = MAIN_MENU;
@@ -2062,8 +2441,13 @@ void loop() {
   }
 
   if (isPressed(BTN_BACK, lastBackState)) {
-    currentState = MAIN_MENU;
-    cursor = 0;
+    if (currentState == WIFI_SNIFFER_MENU) {
+      currentState = WIFI_MENU;
+      cursor = 5;
+    } else {
+      currentState = MAIN_MENU;
+      cursor = 0;
+    }
   }
 
   if (isPressed(BTN_OK, lastOkState)) {
@@ -2072,15 +2456,26 @@ void loop() {
       else if (cursor == 1) currentState = BLE_MENU;
       else if (cursor == 2) currentState = SUBGHZ_MENU;
       else if (cursor == 3) currentState = IR_MENU;
-      else if (cursor == 4) currentState = NRF_MENU; 
+      else if (cursor == 4) currentState = NRF_MENU;
+      else if (cursor == 5) currentState = SETTINGS_MENU; 
       cursor = 0;
     }
-    else if (currentState == WIFI_MENU) {
-      if (cursor == 0) runDeauth();
-      else if (cursor == 1) runWiFiScan();
-      else if (cursor == 2) runBeaconSpam();
-      else if (cursor == 3) runWiFiPacket();
-      else if (cursor == 4) runEvilPortal();
+  else if (currentState == WIFI_MENU) {
+    if (cursor == 0) runDeauth();
+    else if (cursor == 1) runWiFiScan();
+    else if (cursor == 2) runBeaconSpam();
+    else if (cursor == 3) runWiFiPacket();
+    else if (cursor == 4) runEvilPortal();
+    else if (cursor == 5) {
+      currentState = WIFI_SNIFFER_MENU;
+      cursor = 0;
+    }
+  }
+    else if (currentState == WIFI_SNIFFER_MENU) {
+      if (cursor == 0) runBeaconSniff();
+      else if (cursor == 1) runDeauthSniff();
+      else if (cursor == 2) runPwnagotchiSniff();
+    else if (cursor == 3) runPineappleSniff();
     }
     else if (currentState == BLE_MENU) {
       if (cursor == 0) runBLEIosSpam();
@@ -2105,6 +2500,10 @@ void loop() {
     else if (currentState == NRF_MENU) {
       if (cursor == 0) runNRF24Spectrum();
       else if (cursor == 1) runNRF24JammerMenu();
+    }
+    else if (currentState == SETTINGS_MENU) {
+      if (cursor == 0) runSettingsAbout();
+      else if (cursor == 1) runSettingsTurnOff();
     }
   }
 
