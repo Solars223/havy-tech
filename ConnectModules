@@ -1,0 +1,32 @@
+Connect modules:
+Oled 0.96 ssd1306: 
+SCL - 22, SDA - 21
+
+BUTTONS:
+UP         27
+DOWN       26
+OK         33
+BACK       32
+
+CC1101: 
+GDO0    4
+CS      5
+SCK     18
+MOSI    23
+MISO    19
+
+NRF24 L01/E01:
+CE	  25	
+CSN	  2	
+SCK	  18	
+MOSI	23	
+MISO	19	
+
+SD CARD MODULE: 
+CS          15
+MOSI        13
+SCK         14
+MISO        17
+
+IR_TX / IR RX
+16    /  35
