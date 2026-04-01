@@ -15,7 +15,7 @@
 
 | Модуль | Функционал |
 | :--- | :--- |
-| **📡 Wi-Fi** | Deauth атака, Beacon Spam (сотни фейковых точек), Сканирование сетей, Мониторинг пакетов, Evil Portal |
+| **📡 Wi-Fi** | Deauth атака, Beacon Spam (сотни фейковых точек), Сканирование сетей, Мониторинг пакетов, Evil Portal, Sniffer deauth/beacon/pwnatgotchi/pineaple|
 | **🔵 Bluetooth** | iOS Spam (AirDrop-рассылка), Android Spam, Windows Spam (Swift Pair) |
 | **📻 Sub-GHz** | Чтение/Отправка сигналов, Raw режим, Анализатор спектра, Глушилка (Jammer), Брутфорс кодов |
 | **🔦 Infrared** | Чтение/Отправка ИК-команд, Универсальный пульт (TV/Проектор), Глушилка ИК |
